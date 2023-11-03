@@ -14,6 +14,12 @@ pub mod rcu_qsbr {
         waiting: i32,
     }
 
+    enum rcu_state {
+        RCU_READER_ACTIVE_CURRENT,
+        RCU_READER_ACTIVE_OLD,
+        RCU_READER_INACTIVE,
+    }
+
     static rcu_gp_lock: Mutex<i32> = Mutex::new(0);
     static rcu_register_lock: Mutex<i32> = Mutex::new(0);
     static mut rcu_gp: rcu_gp = rcu_gp { ctr: 0 };
@@ -27,6 +33,21 @@ pub mod rcu_qsbr {
             registered: false,
             waiting: 0,
         });
+    }
+
+    pub fn rcu_get_state(reader: &rcu_qsbr_reader) -> rcu_state {
+        println!("rcu_get_state");
+        let mut gp_ctr: usize = 0;
+        let mut state: rcu_state = rcu_state::RCU_READER_INACTIVE;
+        if reader.ctr == gp_ctr {
+            state = rcu_state::RCU_READER_ACTIVE_CURRENT;
+        } else if reader.ctr == gp_ctr - 1 {
+            state = rcu_state::RCU_READER_ACTIVE_OLD;
+        } else {
+            state = rcu_state::RCU_READER_INACTIVE;
+        }
+        return state;
+        // not sure if this is correct
     }
 
     pub fn rcu_read_lock() {
@@ -86,7 +107,7 @@ pub mod rcu_qsbr {
             {
                 let mut _num = rcu_register_lock.lock().unwrap();
                 unsafe {
-                    if (rcu_qsbr_reader_list.len() == 0) {
+                    if rcu_qsbr_reader_list.len() == 0 {
                         return;
                     } else {
                         wait_for_readers();
@@ -99,5 +120,23 @@ pub mod rcu_qsbr {
     pub fn wait_for_readers() {
         println!("wait_for_readers");
         // do nothing
+        unsafe {
+            let mut iter = rcu_qsbr_reader_list.iter();
+            while let Some(rcu_qsbr_reader) = iter.next() {
+                if (rcu_qsbr_reader.registered) {
+                    let state = rcu_get_state(rcu_qsbr_reader);
+                    if (state == rcu_state::RCU_READER_ACTIVE_CURRENT) {
+                        return;
+                    }
+                    else if (state == rcu_state::RCU_READER_ACTIVE_OLD) {
+                        return;
+                    }
+                    else {
+                        // do nothing
+                        // keep waiting
+                    }
+                }
+            }
+        }
     }
 }
