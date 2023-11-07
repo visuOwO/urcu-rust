@@ -2,7 +2,11 @@ pub mod rcu_qsbr {
     use std::sync::{Arc, Mutex};
     use std::thread::{self, ThreadId};
     use std::collections::LinkedList;
-    use std::cell::RefCell;
+    use std::cell::{Ref, RefCell};
+    use std::rc::Rc;
+    use crate::utils::list::list::{cds_list_add, cds_list_empty, cds_list_head, cds_list_move, cds_list_splice, cds_list_del};
+    use crate::{rcu_qsbr, utils};
+
     struct rcu_gp {
         pub ctr: usize,
     }
@@ -11,6 +15,7 @@ pub mod rcu_qsbr {
         pub tid: ThreadId,
         pub ctr: usize,
         pub registered: bool,
+        pub node: Option<*mut cds_list_head>,
         waiting: i32,
     }
 
@@ -23,14 +28,19 @@ pub mod rcu_qsbr {
     static rcu_gp_lock: Mutex<i32> = Mutex::new(0);
     static rcu_register_lock: Mutex<i32> = Mutex::new(0);
     static mut rcu_gp: rcu_gp = rcu_gp { ctr: 0 };
-    static mut rcu_qsbr_reader_list: LinkedList<rcu_qsbr_reader> =
-        LinkedList::new();
+    static registry: Option<*mut cds_list_head> = None;
+    static gp_futex: Mutex<i32> = Mutex::new(0);
 
     thread_local! {
         static rcu_qsbr_reader_local: RefCell<rcu_qsbr_reader> = RefCell::new(rcu_qsbr_reader {
             tid: thread::current().id(),
             ctr: 0,
             registered: false,
+            node: node{
+                data: 0,
+                next: None,
+                prev: None,
+            },
             waiting: 0,
         });
     }
@@ -74,15 +84,18 @@ pub mod rcu_qsbr {
         {
             let mut _num = rcu_register_lock.lock().unwrap();
             println!("rcu_thread_register");
-            rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
-                *rcu_qsbr_reader.borrow_mut() = rcu_qsbr_reader {
-                    tid: thread::current().id(),
-                    ctr: 0,
-                    registered: true,
-                    waiting: 0,
-                };
-            });
-            // TODO: add to list
+            {
+                let mut _num = rcu_register_lock.lock().unwrap();
+                rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+                    rcu_qsbr_reader.borrow_mut().ctr = 1;
+                    *rcu_qsbr_reader.borrow_mut().registered = true;
+                });
+                rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+                    unsafe {
+                        registry.cds_list_add(rcu_qsbr_reader.borrow_mut().node);
+                    }
+                });
+            }
         }
     }
     pub fn rcu_thread_unregister() {
@@ -90,53 +103,93 @@ pub mod rcu_qsbr {
             let mut _num = rcu_register_lock.lock().unwrap();
             println!("rcu_thread_unregister");
             rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
-                *rcu_qsbr_reader.borrow_mut() = rcu_qsbr_reader {
-                    tid: thread::current().id(),
-                    ctr: 0,
-                    registered: false,
-                    waiting: 0,
-                };
+                *rcu_qsbr_reader.borrow_mut().ctr = 0;
+                *rcu_qsbr_reader.borrow_mut().registered = false;
             });
-            // TODO: remove from list
+            rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+                unsafe {
+                    cds_list_del(rcu_qsbr_reader.borrow_mut().node.unwrap());
+                }
+            });
         }
     }
     pub fn synchronize_rcu() {
         println!("synchronize_rcu");
-        {
-            let mut _num = rcu_gp_lock.lock().unwrap();
-            {
-                let mut _num = rcu_register_lock.lock().unwrap();
-                unsafe {
-                    if rcu_qsbr_reader_list.len() == 0 {
-                        return;
-                    } else {
-                        wait_for_readers();
-                    }
-                }
+        let mut qsreaders = utils::list::list::cds_list_head::new();
+        let was_online = rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+            let mut reader = rcu_qsbr_reader.borrow_mut();
+            return reader.ctr;
+        });
 
-            }
+        wait_for_readers(registry.unwrap(), *qsreaders);
+    }
+
+    pub fn rcu_thread_offline() {
+        println!("rcu_thread_offline");
+        let mut qsreaders = utils::list::list::cds_list_head::new();
+        let was_online = rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+            let mut reader = rcu_qsbr_reader.borrow_mut();
+            return reader.ctr;
+        });
+        if (was_online) {
+            rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+                let mut reader = rcu_qsbr_reader.borrow_mut();
+                reader.ctr = 0;
+            });
+            wake_up_gp();
         }
     }
-    pub fn wait_for_readers() {
-        println!("wait_for_readers");
+
+    pub fn wake_up_gp() {
+        println!("wake_up_gp");
         // do nothing
-        unsafe {
-            let mut iter = rcu_qsbr_reader_list.iter();
-            while let Some(rcu_qsbr_reader) = iter.next() {
-                if (rcu_qsbr_reader.registered) {
-                    let state = rcu_get_state(rcu_qsbr_reader);
-                    if (state == rcu_state::RCU_READER_ACTIVE_CURRENT) {
-                        return;
-                    }
-                    else if (state == rcu_state::RCU_READER_ACTIVE_OLD) {
-                        return;
-                    }
-                    else {
-                        // do nothing
-                        // keep waiting
+    }
+
+    pub fn wait_for_readers(input_reader: *mut cds_list_head,  qsreaders: *mut cds_list_head) {
+        println!("wait_for_readers");
+        let mut wait_loops = 0;
+        loop {
+            wait_loops += 1;
+            if (wait_loops > 1000) {
+                let mut index = registry.unwrap();
+                loop {
+                    let mut reader = index.unwrap();
+                    reader.waiting = 1;
+                    if (index.unwrap().next == index) {
+                        break;
                     }
                 }
             }
+            loop {
+                let mut reader = input_reader.unwrap();
+                if (reader.next == input_reader) {
+                    break;
+                }
+                let mut state = rcu_get_state(reader);
+                if (state == rcu_state::RCU_READER_ACTIVE_CURRENT) {
+                    break;
+                } else if (state == rcu_state::RCU_READER_ACTIVE_OLD) {
+                    break;
+                } else {
+                    if (reader.waiting == 0) {
+                        unsafe {
+                            cds_list_move(reader, qsreaders);
+                        }
+                    }
+                }
+            }
+            if (cds_list_empty(registry.unwrap())) {
+                *gp_futex.lock().unwrap() = 0;
+break;
+            } else {
+                wait_gp();
+            }
         }
+        cds_list_splice(qsreaders, registry.unwrap());
+    }
+
+    pub fn wait_gp() {
+        println!("wait_gp");
+        // TODO: implement waiting for grace period
     }
 }
