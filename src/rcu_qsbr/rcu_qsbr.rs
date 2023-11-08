@@ -6,6 +6,7 @@ pub mod rcu_qsbr {
     use std::rc::Rc;
     use crate::utils::list::list::{cds_list_add, cds_list_empty, cds_list_head, cds_list_move, cds_list_splice, cds_list_del};
     use crate::{rcu_qsbr, utils};
+    use crate::utils::mutex::mutex::compat_futex_noasync;
 
     struct rcu_gp {
         pub ctr: usize,
@@ -190,6 +191,13 @@ break;
 
     pub fn wait_gp() {
         println!("wait_gp");
-        // TODO: implement waiting for grace period
+        {
+            let num = gp_futex.lock().unwrap();
+            if (*num == -1) {
+                compat_futex_noasync(*gp_futex.lock().unwrap(),
+                                     utils::mutex::mutex::futex_stat::FUTEX_WAIT, -1,
+                                     0);
+            }
+        }
     }
 }
