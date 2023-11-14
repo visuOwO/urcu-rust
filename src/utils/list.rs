@@ -6,12 +6,14 @@ pub mod list {
     pub struct cds_list_head {
         pub(crate) next: Option<*mut cds_list_head>,
         prev: Option<*mut cds_list_head>,
+        data: i32,
     }
 
     pub fn new() -> cds_list_head {
         let mut m = cds_list_head {
             next: None,
             prev: None,
+            data: -1,
         };
         m.next = Some(&m as *const cds_list_head as *mut cds_list_head);
         m.prev = Some(&m as *const cds_list_head as *mut cds_list_head);

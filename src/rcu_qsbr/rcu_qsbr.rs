@@ -31,6 +31,7 @@ pub mod rcu_qsbr {
     static mut rcu_gp: rcu_gp = rcu_gp { ctr: 0 };
     static registry: Option<*mut cds_list_head> = None;
     static gp_futex: Mutex<i32> = Mutex::new(0);
+    static gp_ctr: usize = 1;
 
     thread_local! {
         static rcu_qsbr_reader_local: RefCell<rcu_qsbr_reader> = RefCell::new(rcu_qsbr_reader {
@@ -42,13 +43,12 @@ pub mod rcu_qsbr {
                 next: None,
                 prev: None,
             },
-            waiting: 0,
+            waiting: 0, // 1 if waiting for grace period, 0 otherwise
         });
     }
 
     pub fn rcu_get_state(reader: &rcu_qsbr_reader) -> rcu_state {
         println!("rcu_get_state");
-        let mut gp_ctr: usize = 0;
         let mut state: rcu_state = rcu_state::RCU_READER_INACTIVE;
         if reader.ctr == gp_ctr {
             state = rcu_state::RCU_READER_ACTIVE_CURRENT;
@@ -71,11 +71,13 @@ pub mod rcu_qsbr {
     }
     pub fn rcu_quiescent_state() {
         println!("rcu_quiescent_state");
-        let mut gp_ctr: usize = 0;
         if (true) {
-            return;
+            rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+                let mut reader = rcu_qsbr_reader.borrow_mut();
+                reader.ctr = gp_ctr;
+            });
         }
-        _rcu_quiescent_state_update_and_wakeup(gp_ctr);
+        _rcu_quiescent_state_update_and_wakeup(gp_ctr); // wake up writer
     }
     pub fn _rcu_quiescent_state_update_and_wakeup(gp_ctr: usize) {
         println!("_rcu_quiescent_state_update_and_wakeup");
@@ -121,7 +123,9 @@ pub mod rcu_qsbr {
             let mut reader = rcu_qsbr_reader.borrow_mut();
             return reader.ctr;
         });
-
+        if (was_online) {
+            rcu_thread_offline();
+        }
         wait_for_readers(registry.unwrap(), *qsreaders);
     }
 
@@ -144,6 +148,20 @@ pub mod rcu_qsbr {
     pub fn wake_up_gp() {
         println!("wake_up_gp");
         // do nothing
+        if (rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+            let mut reader = rcu_qsbr_reader.borrow_mut();
+            return reader.waiting;
+        }) == 1) {
+            unsafe {
+                compat_futex_noasync(gp_futex.lock().unwrap(),
+                                     utils::mutex::mutex::futex_stat::FUTEX_WAKE, 1,
+                                     0);
+                rcu_qsbr_reader_local.with(|rcu_qsbr_reader| {
+                    let mut reader = rcu_qsbr_reader.borrow_mut();
+                    reader.waiting = 0;
+                });
+            }
+        }
     }
 
     pub fn wait_for_readers(input_reader: *mut cds_list_head,  qsreaders: *mut cds_list_head) {
@@ -162,6 +180,7 @@ pub mod rcu_qsbr {
                 }
             }
             loop {
+                // TODO: error here, the input reader is not a pointer of rcu_reader
                 let mut reader = input_reader.unwrap();
                 if (reader.next == input_reader) {
                     break;
@@ -194,7 +213,7 @@ break;
         {
             let num = gp_futex.lock().unwrap();
             if (*num == -1) {
-                compat_futex_noasync(*gp_futex.lock().unwrap(),
+                compat_futex_noasync(gp_futex.lock().unwrap(),
                                      utils::mutex::mutex::futex_stat::FUTEX_WAIT, -1,
                                      0);
             }

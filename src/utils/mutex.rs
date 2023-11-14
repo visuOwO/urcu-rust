@@ -1,5 +1,5 @@
 pub mod mutex {
-    use std::sync::{Arc, Mutex, Condvar};
+    use std::sync::{Arc, Mutex, Condvar, MutexGuard};
     struct timespec {
         tv_sec: i64,
         tv_nsec: i64,
@@ -11,7 +11,7 @@ pub mod mutex {
 
     static futex_lock: Mutex<i32> = Mutex::new(0);
     static cond_var: Arc<Condvar> = Arc::new(Condvar::new());
-    pub fn compat_futex_noasync(uaddr: i32, futex_op: futex_stat, val: i32, val3: i32) -> i32 {
+    pub fn compat_futex_noasync(uaddr: MutexGuard<i32>, futex_op: futex_stat, val: i32, val3: i32) -> i32 {
         let mut ret: i32 = 0;
         let mut oldval: i32 = 0;
         let mut newval: i32 = 0;

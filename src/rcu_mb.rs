@@ -1,1 +1,1 @@
-pub mod rcu_mb;
+mod rcu_mb;
