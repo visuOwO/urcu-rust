@@ -2,17 +2,23 @@ pub mod rcu_mb {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ops::Deref;
-    use std::thread::ThreadId;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread::{current, ThreadId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use lazy_static::lazy_static;
+    use std::collections::LinkedList;
+    use crate::utils::utils::{store_shared, load_shared, barrier};
 
     struct RcuSync {
-        reader_flags: HashMap<ThreadId, AtomicBool>,
+        reader_flags: HashMap<ThreadId, RcuReader>,
         total_threads: AtomicUsize,
     }
 
     static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+    const RCU_GP_CTR_PHASE: usize = 0x1000;
+    const RCU_NEST_MASK: usize = 0x0fff;
+    const RCU_NEST_COUNT: usize = 0x1;
 
     impl RcuSync {
         fn new() -> RcuSync {
@@ -21,35 +27,25 @@ pub mod rcu_mb {
                 total_threads: AtomicUsize::new(0),
             }
         }
-
-        fn set_reader_flag(&mut self, thread_id: ThreadId, value: bool) {
-            let flag = self.reader_flags.entry(thread_id).or_insert_with(|| AtomicBool::new(false));
-            flag.store(value, Ordering::Release);
-        }
-
-        fn all_readers_inactive(&self) -> bool {
-            self.reader_flags.values().all(|flag| !flag.load(Ordering::Acquire))
-        }
-
-        fn remove_reader_flag(&mut self, thread_id: &ThreadId) {
-            self.reader_flags.remove(thread_id);
-        }
     }
 
     lazy_static! {
         static ref RCU_SYNC: RefCell<RcuSync> = RefCell::new(RcuSync::new());
+        static ref RCU_GP_LOCK: Arc<Mutex<LinkedList<RcuReader>>> = Arc::new(Mutex::new(LinkedList::new()));
+        static ref RCU_GP_CTRL: AtomicUsize = AtomicUsize::new(RCU_NEST_COUNT);
     }
 
     thread_local! {
-        static RCU_READER: RefCell<rcu_reader> = std::cell::RefCell::new(rcu_reader {
-            ctr: AtomicBool.new(false),
+        static RCU_READER: RcuReader = RcuReader {
+            ctr: 0,
             tid: std::thread::current().id(),
-            id: -1,
-        });
+            id: usize::MAX,
+            registered: false,
+        };
     }
 
     struct RcuReader {
-        ctr: AtomicBool,
+        ctr: usize,
         tid: ThreadId,
         id: usize,
         registered: bool,
@@ -58,7 +54,7 @@ pub mod rcu_mb {
     impl RcuReader {
         fn new() -> Self {
             Self {
-                ctr: AtomicBool::new(false),
+                ctr: 0,
                 tid: std::thread::current().id(),
                 id: usize::MAX,
                 registered: false,
@@ -68,20 +64,47 @@ pub mod rcu_mb {
 
     pub fn rcu_reader_lock() {
         println!("rcu_reader_lock");
-        let tid = std::thread::current().id();
-        RCU_SYNC.set_reader_flag(tid, true);
+        let thread_id = current().id();
+        let reader = RCU_SYNC.borrow_mut().reader_flags.get_mut(&thread_id).unwrap();
+        let tmp = reader.ctr;
+        if tmp & RCU_NEST_MASK == 0 {
+            store_shared(&reader.ctr, RCU_GP_CTRL.load(Ordering::SeqCst));
+            std::sync::atomic::fence(Ordering::SeqCst);
+        } else {
+            store_shared(&reader.ctr, tmp + RCU_NEST_COUNT)
+        }
     }
 
     pub fn rcu_reader_unlock() {
         println!("rcu_reader_unlock");
-        let tid = std::thread::current().id();
-        RCU_SYNC.set_reader_flag(tid, false);
+        barrier();
+        let thread_id = current().id();
+        let reader = RCU_SYNC.borrow_mut().reader_flags.get_mut(&thread_id).unwrap();
+        store_shared(&reader.ctr, reader.ctr - RCU_NEST_COUNT);
     }
 
     pub fn synchronize_rcu() {
         println!("synchronize_rcu");
-        while !RCU_SYNC.all_reader_inactive() {
-            std::thread::yield_now();
+        barrier();
+        let _guard = RCU_GP_LOCK.lock().unwrap();
+        update_counter_and_wait();
+        barrier();
+        update_counter_and_wait();
+        barrier();
+    }
+
+    pub fn rcu_gp_ongoing(ctr: &usize) -> bool {
+        let v = load_shared(ctr);
+        (v & RCU_NEST_MASK) && ((v ^ RCU_GP_CTRL.load(Ordering::SeqCst)) & RCU_GP_CTR_PHASE)
+    }
+
+    pub fn update_counter_and_wait() {
+        RCU_GP_CTRL.fetch_xor(RCU_GP_CTR_PHASE, Ordering::SeqCst);
+        barrier();
+        for reader in RCU_SYNC.borrow_mut().reader_flags.values() {
+            while rcu_gp_ongoing(&reader.ctr) {
+                std::thread::yield_now();
+            }
         }
     }
 
@@ -89,7 +112,7 @@ pub mod rcu_mb {
         println!("rcu_register_thread");
         let mut guard = REGISTRY_LOCK.lock().unwrap();
         let tid = std::thread::current().id();
-        RCU_SYNC.set_reader_flag(tid, false);
+        RCU_SYNC.borrow_mut().reader_flags.insert(tid, RcuReader::new());
         guard.deref();
     }
 
@@ -97,7 +120,8 @@ pub mod rcu_mb {
         println!("rcu_unregister_thread");
         let mut guard = REGISTRY_LOCK.lock().unwrap();
         let tid = std::thread::current().id();
-        RCU_SYNC.remove_reader_flag(&tid);
+        RCU_SYNC.borrow_mut().reader_flags.remove(&tid);
         guard.deref();
     }
+
 }
