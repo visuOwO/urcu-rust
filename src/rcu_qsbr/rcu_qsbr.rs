@@ -7,16 +7,14 @@ pub mod rcu_qsbr {
     use crate::common::rcu_common::rcu_common::RcuReader;
     use crate::common::utils::{barrier, load_shared, store_shared};
 
-    static RCU_GP_LOCK: Mutex<i32> = Mutex::new(0);
     static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
-    static GP_FUTEX: Mutex<i32> = Mutex::new(0);
+    static GP_LOCK: Mutex<i32> = Mutex::new(0);
     static GP_CTR: usize = 1;
     static RCU_GP_CTR: usize = 0x2;
     static RCU_GP_ONLINE: usize = 0x1;
 
     lazy_static! {
         static ref RCU_SYNC: RefCell<RcuSync> = RefCell::new(RcuSync::new());
-        static ref RCU_REGISTER_LOCK: Mutex<i32> = Mutex::new(0);
     }
 
 
@@ -76,7 +74,7 @@ pub mod rcu_qsbr {
             store_shared(&reader.ctr, 0);
         }
 
-        let _guard = GP_FUTEX.lock().unwrap();
+        let _guard = GP_LOCK.lock().unwrap();
         update_counter_and_wait();
         drop(_guard);
         if was_online {
