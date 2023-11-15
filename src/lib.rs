@@ -1,6 +1,6 @@
 pub mod rcu_qsbr;
 pub mod rcu_mb;
-pub mod utils;
+pub mod common;
 
 pub fn add(left: usize, right: usize) -> usize {
     left + right

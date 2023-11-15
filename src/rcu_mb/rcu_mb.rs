@@ -1,18 +1,14 @@
 pub mod rcu_mb {
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::ops::Deref;
-    use std::thread::{current, ThreadId};
+    use std::thread::current;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use lazy_static::lazy_static;
     use std::collections::LinkedList;
-    use crate::utils::utils::{store_shared, load_shared, barrier};
+    use crate::common::utils::{store_shared, load_shared, barrier};
+    use crate::common::rcu_common::rcu_common::{RcuReader, RcuSync};
 
-    struct RcuSync {
-        reader_flags: HashMap<ThreadId, RcuReader>,
-        total_threads: AtomicUsize,
-    }
 
     static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
@@ -20,46 +16,10 @@ pub mod rcu_mb {
     const RCU_NEST_MASK: usize = 0x0fff;
     const RCU_NEST_COUNT: usize = 0x1;
 
-    impl RcuSync {
-        fn new() -> RcuSync {
-            RcuSync {
-                reader_flags: HashMap::new(),
-                total_threads: AtomicUsize::new(0),
-            }
-        }
-    }
-
     lazy_static! {
         static ref RCU_SYNC: RefCell<RcuSync> = RefCell::new(RcuSync::new());
         static ref RCU_GP_LOCK: Arc<Mutex<LinkedList<RcuReader>>> = Arc::new(Mutex::new(LinkedList::new()));
         static ref RCU_GP_CTRL: AtomicUsize = AtomicUsize::new(RCU_NEST_COUNT);
-    }
-
-    thread_local! {
-        static RCU_READER: RcuReader = RcuReader {
-            ctr: 0,
-            tid: std::thread::current().id(),
-            id: usize::MAX,
-            registered: false,
-        };
-    }
-
-    struct RcuReader {
-        ctr: usize,
-        tid: ThreadId,
-        id: usize,
-        registered: bool,
-    }
-
-    impl RcuReader {
-        fn new() -> Self {
-            Self {
-                ctr: 0,
-                tid: std::thread::current().id(),
-                id: usize::MAX,
-                registered: false,
-            }
-        }
     }
 
     pub fn rcu_reader_lock() {
@@ -123,5 +83,4 @@ pub mod rcu_mb {
         RCU_SYNC.borrow_mut().reader_flags.remove(&tid);
         guard.deref();
     }
-
 }
